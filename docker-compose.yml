@@ -1,0 +1,92 @@
+# ==============================================================================
+# FlowFable — Docker Compose
+#
+# Local development (infra only, apps run with `pnpm dev`):
+#   docker compose up -d            # postgres + redis + mailpit
+#
+# Full self-hosted stack (available once apps land in Phase 2+):
+#   docker compose --profile app up -d --build
+# ==============================================================================
+
+name: flowfable
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-flowfable}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flowfable}
+      POSTGRES_DB: ${POSTGRES_DB:-flowfable}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-flowfable} -d ${POSTGRES_DB:-flowfable}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Local SMTP catcher — view outgoing mail at http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - '1025:1025' # SMTP
+      - '8025:8025' # Web UI
+
+  # ----------------------------------------------------------------------------
+  # Application services (profile: app) — built from Phase 2 onward.
+  # ----------------------------------------------------------------------------
+  api:
+    profiles: ['app']
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowfable}:${POSTGRES_PASSWORD:-flowfable}@postgres:5432/${POSTGRES_DB:-flowfable}?schema=public
+      REDIS_URL: redis://redis:6379
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+    ports:
+      - '3001:3001'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    profiles: ['app']
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      API_URL: http://api:3001
+    ports:
+      - '3000:3000'
+    depends_on:
+      - api
+
+volumes:
+  postgres-data:
+  redis-data:
