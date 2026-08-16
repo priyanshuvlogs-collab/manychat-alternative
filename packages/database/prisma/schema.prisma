@@ -1,0 +1,963 @@
+// ==============================================================================
+// FlowFable — Database Schema
+//
+// Multi-tenant design: nearly every row belongs to a Workspace. All queries in
+// the API layer MUST be scoped by workspaceId — this is enforced by a Prisma
+// middleware in the API app (Phase 2).
+//
+// Domains:
+//   1. Identity & Teams   — User, Session, Workspace, WorkspaceMember, Invitation, ApiKey
+//   2. Channels           — Channel (Instagram, Messenger, WhatsApp, Telegram, WebChat, …)
+//   3. Contacts & CRM     — Contact, ContactIdentity, CustomFieldDefinition, Tag, Segment, Note
+//   4. Inbox              — Conversation, Message
+//   5. Automation         — Flow, FlowVersion, FlowTrigger, FlowSession
+//   6. Campaigns          — Sequence, SequenceStep, SequenceEnrollment, Broadcast, BroadcastRecipient
+//   7. AI                 — AiProviderCredential, AiAgent, KnowledgeBase, KnowledgeSource, KnowledgeChunk
+//   8. Integrations       — Webhook, WebhookDelivery
+//   9. Observability      — DailyStat, AuditLog
+// ==============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  output          = "../src/generated/client"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+// ==============================================================================
+// 1. IDENTITY & TEAMS
+// ==============================================================================
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  passwordHash  String? // null for OAuth-only users
+  name          String
+  avatarUrl     String?
+  emailVerified DateTime?
+  isSuperAdmin  Boolean   @default(false) // instance-level admin (self-host operator)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  memberships       WorkspaceMember[]
+  sessions          Session[]
+  sentInvitations   Invitation[]      @relation("InvitedBy")
+  assignedConvos    Conversation[]    @relation("AssignedAgent")
+  sentMessages      Message[]         @relation("SentByUser")
+  notes             Note[]
+  auditLogs         AuditLog[]
+
+  @@map("users")
+}
+
+/// Refresh-token sessions (access tokens are stateless JWTs).
+model Session {
+  id               String   @id @default(cuid())
+  userId           String
+  refreshTokenHash String   @unique
+  userAgent        String?
+  ipAddress        String?
+  expiresAt        DateTime
+  createdAt        DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+/// The tenant. Every business/brand gets a workspace; users can belong to many.
+model Workspace {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  logoUrl   String? // white-label: custom logo
+  /// White-label & workspace-level settings (brand colors, custom domain, timezone, locale…)
+  settings  Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members               WorkspaceMember[]
+  invitations           Invitation[]
+  apiKeys               ApiKey[]
+  channels              Channel[]
+  contacts              Contact[]
+  customFieldDefs       CustomFieldDefinition[]
+  tags                  Tag[]
+  segments              Segment[]
+  conversations         Conversation[]
+  flows                 Flow[]
+  sequences             Sequence[]
+  broadcasts            Broadcast[]
+  aiProviderCredentials AiProviderCredential[]
+  aiAgents              AiAgent[]
+  knowledgeBases        KnowledgeBase[]
+  webhooks              Webhook[]
+  dailyStats            DailyStat[]
+  auditLogs             AuditLog[]
+
+  @@map("workspaces")
+}
+
+enum WorkspaceRole {
+  OWNER // full control incl. billing & deletion
+  ADMIN // manage members, channels, flows, settings
+  AGENT // inbox access, assigned conversations, contacts
+  VIEWER // read-only (analytics, flows)
+}
+
+model WorkspaceMember {
+  id          String        @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        WorkspaceRole @default(AGENT)
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@map("workspace_members")
+}
+
+model Invitation {
+  id          String        @id @default(cuid())
+  workspaceId String
+  email       String
+  role        WorkspaceRole @default(AGENT)
+  token       String        @unique
+  invitedById String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy User      @relation("InvitedBy", fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, email])
+  @@map("invitations")
+}
+
+/// Programmatic access to the public REST API (per workspace).
+model ApiKey {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  /// SHA-256 hash of the key; plaintext is shown once at creation.
+  keyHash     String    @unique
+  /// First 8 chars of the key, for identification in the UI.
+  keyPrefix   String
+  scopes      String[]  @default([])
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@map("api_keys")
+}
+
+// ==============================================================================
+// 2. CHANNELS
+// ==============================================================================
+
+enum ChannelType {
+  INSTAGRAM
+  MESSENGER
+  WHATSAPP
+  TELEGRAM
+  WEBCHAT
+  EMAIL
+  SMS
+}
+
+enum ChannelStatus {
+  CONNECTED
+  DISCONNECTED // user disconnected or token revoked
+  ERROR // auth expired / API error, needs re-auth
+  PENDING // OAuth in progress
+}
+
+/// A connected messaging account (an IG business account, an FB page,
+/// a WhatsApp number, a Telegram bot, a webchat widget…).
+model Channel {
+  id          String        @id @default(cuid())
+  workspaceId String
+  type        ChannelType
+  status      ChannelStatus @default(PENDING)
+  /// Human-readable name, e.g. "@mybrand" or "My FB Page"
+  name        String
+  /// Platform-side identifier (IG business account id, FB page id,
+  /// WhatsApp phone number id, Telegram bot id, widget public key…)
+  externalId  String
+  /// AES-256-GCM encrypted credentials blob (access tokens, bot tokens…).
+  /// Never returned by the API.
+  credentials Json          @default("{}")
+  /// Non-secret channel config (welcome message, ice-breakers, widget theme…)
+  config      Json          @default("{}")
+  lastSyncAt  DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  workspace       Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  identities      ContactIdentity[]
+  conversations   Conversation[]
+  flowTriggers    FlowTrigger[]
+  broadcasts      Broadcast[]
+
+  // One platform account can only be connected once per workspace.
+  @@unique([workspaceId, type, externalId])
+  // Webhook routing: resolve incoming events by platform id fast.
+  @@index([type, externalId])
+  @@map("channels")
+}
+
+// ==============================================================================
+// 3. CONTACTS & CRM
+// ==============================================================================
+
+model Contact {
+  id          String    @id @default(cuid())
+  workspaceId String
+  firstName   String?
+  lastName    String?
+  email       String?
+  phone       String?
+  avatarUrl   String?
+  locale      String?
+  timezone    String?
+  /// Values for CustomFieldDefinitions, keyed by field key: { "plan": "pro" }
+  customFields Json     @default("{}")
+  /// Marketing consent / 24h-window bookkeeping per channel
+  optInStatus Json      @default("{}")
+  /// Set when a contact is blocked from all automation
+  isBlocked   Boolean   @default(false)
+  lastSeenAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  workspace     Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  identities    ContactIdentity[]
+  tags          ContactTag[]
+  conversations Conversation[]
+  notes         Note[]
+  flowSessions  FlowSession[]
+  enrollments   SequenceEnrollment[]
+  broadcastRecipients BroadcastRecipient[]
+
+  @@index([workspaceId, email])
+  @@index([workspaceId, phone])
+  @@index([workspaceId, createdAt])
+  @@map("contacts")
+}
+
+/// Links a Contact to their identity on a specific channel.
+/// The same human on IG + WhatsApp = one Contact, two ContactIdentities.
+model ContactIdentity {
+  id         String   @id @default(cuid())
+  contactId  String
+  channelId  String
+  /// Platform-scoped user id (IGSID, PSID, wa_id, telegram user id, widget visitor id)
+  externalId String
+  /// Platform username/handle where available (e.g. IG @handle)
+  handle     String?
+  /// Raw platform profile payload for debugging/enrichment
+  profile    Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  // A platform user maps to exactly one contact per channel.
+  @@unique([channelId, externalId])
+  @@index([contactId])
+  @@map("contact_identities")
+}
+
+enum CustomFieldType {
+  TEXT
+  NUMBER
+  BOOLEAN
+  DATE
+  SELECT
+  MULTI_SELECT
+  URL
+}
+
+model CustomFieldDefinition {
+  id          String          @id @default(cuid())
+  workspaceId String
+  /// Machine key used in Contact.customFields, e.g. "subscription_plan"
+  key         String
+  label       String
+  type        CustomFieldType @default(TEXT)
+  /// For SELECT / MULTI_SELECT: allowed options
+  options     String[]        @default([])
+  createdAt   DateTime        @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, key])
+  @@map("custom_field_definitions")
+}
+
+model Tag {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  color       String   @default("#6366f1")
+  createdAt   DateTime @default(now())
+
+  workspace Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  contacts  ContactTag[]
+
+  @@unique([workspaceId, name])
+  @@map("tags")
+}
+
+model ContactTag {
+  contactId String
+  tagId     String
+  /// How the tag was applied: "manual" | "flow:<flowId>" | "ai" | "api"
+  source    String   @default("manual")
+  createdAt DateTime @default(now())
+
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([contactId, tagId])
+  @@index([tagId])
+  @@map("contact_tags")
+}
+
+/// A saved dynamic audience. `rules` is a JSON condition tree evaluated at
+/// send/query time, e.g.:
+/// { "all": [ { "field": "tag", "op": "has", "value": "vip" },
+///            { "field": "lastSeenAt", "op": "gt", "value": "-30d" } ] }
+model Segment {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  rules       Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace  Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  broadcasts Broadcast[]
+
+  @@unique([workspaceId, name])
+  @@map("segments")
+}
+
+/// Internal agent notes on a contact (not visible to the contact).
+model Note {
+  id        String   @id @default(cuid())
+  contactId String
+  authorId  String
+  body      String
+  createdAt DateTime @default(now())
+
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([contactId])
+  @@map("notes")
+}
+
+// ==============================================================================
+// 4. INBOX
+// ==============================================================================
+
+enum ConversationStatus {
+  OPEN // needs attention
+  PENDING // waiting on contact
+  SNOOZED // hidden until snoozeUntil
+  RESOLVED // closed
+}
+
+enum HandoverState {
+  BOT // automation owns the conversation
+  AI_AGENT // an AI agent owns the conversation
+  HUMAN // a human agent owns it (bot paused)
+}
+
+model Conversation {
+  id             String             @id @default(cuid())
+  workspaceId    String
+  channelId      String
+  contactId      String
+  status         ConversationStatus @default(OPEN)
+  handoverState  HandoverState      @default(BOT)
+  assignedToId   String? // human agent, when handoverState = HUMAN
+  /// Denormalized for fast inbox list rendering
+  lastMessageAt  DateTime           @default(now())
+  lastMessagePreview String?
+  unreadCount    Int                @default(0)
+  snoozeUntil    DateTime?
+  /// AI sentiment of the recent conversation window: -1.0 .. 1.0
+  sentimentScore Float?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  workspace  Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  channel    Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  contact    Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  assignedTo User?     @relation("AssignedAgent", fields: [assignedToId], references: [id], onDelete: SetNull)
+  messages   Message[]
+
+  // The inbox list query: workspace + status ordered by recency.
+  @@index([workspaceId, status, lastMessageAt(sort: Desc)])
+  @@index([contactId])
+  @@index([assignedToId])
+  @@map("conversations")
+}
+
+enum MessageDirection {
+  INBOUND // contact -> us
+  OUTBOUND // us -> contact
+}
+
+enum SenderType {
+  CONTACT
+  BOT // flow automation
+  AI_AGENT
+  HUMAN_AGENT
+  SYSTEM // handover notices, etc.
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VIDEO
+  AUDIO
+  FILE
+  STICKER
+  LOCATION
+  TEMPLATE // WhatsApp template / structured message
+  CAROUSEL
+  QUICK_REPLY
+  BUTTON
+  STORY_REPLY // IG story reply
+  STORY_MENTION // IG story mention
+  COMMENT // IG/FB comment that triggered automation
+  POSTBACK // button click payload
+  UNSUPPORTED
+}
+
+enum MessageStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  RECEIVED // inbound messages
+}
+
+model Message {
+  id             String           @id @default(cuid())
+  conversationId String
+  direction      MessageDirection
+  senderType     SenderType
+  /// The human agent who sent it (senderType = HUMAN_AGENT)
+  sentByUserId   String?
+  /// The flow/AI agent that produced it, for attribution & analytics
+  sourceFlowId   String?
+  sourceAiAgentId String?
+  type           MessageType      @default(TEXT)
+  /// Normalized cross-channel payload:
+  /// { text?, mediaUrl?, buttons?: [...], cards?: [...], quickReplies?: [...] }
+  content        Json
+  /// Platform message id (for dedup, replies, read receipts)
+  externalId     String?
+  status         MessageStatus    @default(QUEUED)
+  /// Populated when status = FAILED
+  error          String?
+  /// Raw webhook payload kept for debugging (pruned by retention job)
+  raw            Json?
+  createdAt      DateTime         @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sentBy       User?        @relation("SentByUser", fields: [sentByUserId], references: [id], onDelete: SetNull)
+
+  // Dedup inbound webhooks per conversation.
+  @@unique([conversationId, externalId])
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+// ==============================================================================
+// 5. AUTOMATION — FLOWS
+// ==============================================================================
+
+enum FlowStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+/// A flow is the container; the graph itself lives in immutable FlowVersions
+/// so published automations keep running while drafts are edited.
+model Flow {
+  id                 String     @id @default(cuid())
+  workspaceId        String
+  name               String
+  description        String?
+  status             FlowStatus @default(DRAFT)
+  /// Currently live version (null while drafting)
+  publishedVersionId String?    @unique
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  workspace        Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  versions         FlowVersion[] @relation("FlowVersions")
+  publishedVersion FlowVersion?  @relation("PublishedVersion", fields: [publishedVersionId], references: [id])
+  triggers         FlowTrigger[]
+  sessions         FlowSession[]
+
+  @@index([workspaceId, status])
+  @@map("flows")
+}
+
+model FlowVersion {
+  id        String   @id @default(cuid())
+  flowId    String
+  version   Int
+  /// React Flow graph: { nodes: FlowNode[], edges: FlowEdge[] }
+  /// Node/edge payload types are defined in @flowfable/shared.
+  graph     Json
+  createdAt DateTime @default(now())
+
+  flow            Flow  @relation("FlowVersions", fields: [flowId], references: [id], onDelete: Cascade)
+  publishedOfFlow Flow? @relation("PublishedVersion")
+
+  @@unique([flowId, version])
+  @@map("flow_versions")
+}
+
+enum TriggerType {
+  KEYWORD // inbound DM matches keyword
+  COMMENT // IG/FB post comment (Comment-to-DM)
+  STORY_REPLY // IG story reply
+  STORY_MENTION // IG story mention
+  REFERRAL // m.me / ig.me ref links, ads CTX
+  OPT_IN // widget opt-in / new subscriber
+  NEW_CONVERSATION // first message from a new contact
+  WEBHOOK // external system triggers via API
+  MANUAL // agent launches flow from inbox
+  SCHEDULE // cron-like scheduled entry
+}
+
+/// Denormalized trigger index: lets the webhook ingest pipeline find matching
+/// published flows with one indexed query instead of scanning flow graphs.
+model FlowTrigger {
+  id        String      @id @default(cuid())
+  flowId    String
+  channelId String? // null = any channel in the workspace
+  type      TriggerType
+  /// Type-specific matching config:
+  ///  KEYWORD: { keywords: ["price","buy"], match: "exact"|"contains" }
+  ///  COMMENT: { postIds: ["..."]|null, keywords: [...] }
+  ///  SCHEDULE: { cron: "0 9 * * 1" }
+  config    Json        @default("{}")
+  isEnabled Boolean     @default(true)
+  createdAt DateTime    @default(now())
+
+  flow    Flow     @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  channel Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([channelId, type, isEnabled])
+  @@index([flowId])
+  @@map("flow_triggers")
+}
+
+enum FlowSessionStatus {
+  ACTIVE
+  WAITING // paused at a Delay / wait-for-reply node
+  COMPLETED
+  FAILED
+  CANCELLED // e.g. human handover interrupts the flow
+}
+
+/// One contact's journey through one flow (the interpreter's state).
+model FlowSession {
+  id            String            @id @default(cuid())
+  flowId        String
+  flowVersionId String
+  contactId     String
+  status        FlowSessionStatus @default(ACTIVE)
+  currentNodeId String?
+  /// Flow-local variables collected along the way ({{answers}}, HTTP results…)
+  variables     Json              @default("{}")
+  /// When status = WAITING with a timed delay, the resume timestamp
+  resumeAt      DateTime?
+  error         String?
+  startedAt     DateTime          @default(now())
+  completedAt   DateTime?
+  updatedAt     DateTime          @updatedAt
+
+  flow    Flow    @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([contactId, status])
+  @@index([status, resumeAt]) // the scheduler polls WAITING sessions
+  @@index([flowId, status])
+  @@map("flow_sessions")
+}
+
+// ==============================================================================
+// 6. CAMPAIGNS — SEQUENCES & BROADCASTS
+// ==============================================================================
+
+enum SequenceStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+/// Drip campaign: an ordered series of timed steps.
+model Sequence {
+  id          String         @id @default(cuid())
+  workspaceId String
+  name        String
+  status      SequenceStatus @default(ACTIVE)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  workspace   Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  steps       SequenceStep[]
+  enrollments SequenceEnrollment[]
+
+  @@index([workspaceId])
+  @@map("sequences")
+}
+
+model SequenceStep {
+  id         String   @id @default(cuid())
+  sequenceId String
+  order      Int
+  /// Delay after the previous step (seconds)
+  delaySeconds Int    @default(86400)
+  /// What to do: { kind: "message", content: {...} } or { kind: "flow", flowId }
+  action     Json
+  createdAt  DateTime @default(now())
+
+  sequence Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+
+  @@unique([sequenceId, order])
+  @@map("sequence_steps")
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  COMPLETED
+  UNSUBSCRIBED
+  CANCELLED
+}
+
+model SequenceEnrollment {
+  id          String           @id @default(cuid())
+  sequenceId  String
+  contactId   String
+  status      EnrollmentStatus @default(ACTIVE)
+  currentStep Int              @default(0)
+  nextRunAt   DateTime?
+  enrolledAt  DateTime         @default(now())
+  completedAt DateTime?
+
+  sequence Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  contact  Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([sequenceId, contactId])
+  @@index([status, nextRunAt]) // the scheduler polls due enrollments
+  @@map("sequence_enrollments")
+}
+
+enum BroadcastStatus {
+  DRAFT
+  SCHEDULED
+  SENDING
+  SENT
+  CANCELLED
+  FAILED
+}
+
+/// One-off blast to a segment on a channel.
+model Broadcast {
+  id          String          @id @default(cuid())
+  workspaceId String
+  channelId   String
+  segmentId   String? // null = all opted-in contacts on the channel
+  name        String
+  /// Message payload (same normalized shape as Message.content)
+  content     Json
+  status      BroadcastStatus @default(DRAFT)
+  scheduledAt DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  // Denormalized counters updated by the send worker
+  totalCount     Int @default(0)
+  sentCount      Int @default(0)
+  deliveredCount Int @default(0)
+  readCount      Int @default(0)
+  failedCount    Int @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  workspace  Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  channel    Channel              @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  segment    Segment?             @relation(fields: [segmentId], references: [id], onDelete: SetNull)
+  recipients BroadcastRecipient[]
+
+  @@index([workspaceId, status])
+  @@index([status, scheduledAt])
+  @@map("broadcasts")
+}
+
+model BroadcastRecipient {
+  id          String        @id @default(cuid())
+  broadcastId String
+  contactId   String
+  status      MessageStatus @default(QUEUED)
+  error       String?
+  sentAt      DateTime?
+
+  broadcast Broadcast @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  contact   Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([broadcastId, contactId])
+  @@index([broadcastId, status])
+  @@map("broadcast_recipients")
+}
+
+// ==============================================================================
+// 7. AI
+// ==============================================================================
+
+enum AiProvider {
+  OPENAI
+  ANTHROPIC
+  GOOGLE
+  XAI
+  LOCAL // any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio)
+}
+
+/// BYOK: workspace-scoped provider keys, encrypted at rest.
+model AiProviderCredential {
+  id          String     @id @default(cuid())
+  workspaceId String
+  provider    AiProvider
+  name        String // "Personal OpenAI key"
+  /// AES-256-GCM encrypted { apiKey, baseUrl? }
+  credentials Json
+  isDefault   Boolean    @default(false)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  aiAgents  AiAgent[]
+
+  @@unique([workspaceId, provider, name])
+  @@map("ai_provider_credentials")
+}
+
+/// A configured AI persona that can be attached to flows ("AI Response" node)
+/// or take over whole conversations.
+model AiAgent {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  credentialId    String?
+  knowledgeBaseId String?
+  name            String
+  /// e.g. "gpt-4o-mini", "claude-3-5-sonnet", "gemini-2.0-flash"
+  model           String
+  systemPrompt    String
+  temperature     Float    @default(0.7)
+  maxTokens       Int      @default(1024)
+  /// Behavior config: lead-qualification questions, handover rules,
+  /// allowed tools, auto-tagging rules, guardrails…
+  config          Json     @default("{}")
+  isEnabled       Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace     Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  credential    AiProviderCredential? @relation(fields: [credentialId], references: [id], onDelete: SetNull)
+  knowledgeBase KnowledgeBase?        @relation(fields: [knowledgeBaseId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId])
+  @@map("ai_agents")
+}
+
+model KnowledgeBase {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  /// Embedding config is frozen per KB so all chunks share one vector space
+  embeddingModel String @default("text-embedding-3-small")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  sources   KnowledgeSource[]
+  chunks    KnowledgeChunk[]
+  aiAgents  AiAgent[]
+
+  @@unique([workspaceId, name])
+  @@map("knowledge_bases")
+}
+
+enum KnowledgeSourceType {
+  TEXT // pasted text / manual Q&A
+  FILE // uploaded PDF/DOCX/MD
+  URL // crawled web page
+  SITEMAP // crawled site
+}
+
+enum IngestionStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model KnowledgeSource {
+  id              String              @id @default(cuid())
+  knowledgeBaseId String
+  type            KnowledgeSourceType
+  name            String
+  /// TEXT: the raw content; FILE: storage key; URL/SITEMAP: the address
+  location        String
+  status          IngestionStatus     @default(PENDING)
+  error           String?
+  chunkCount      Int                 @default(0)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  knowledgeBase KnowledgeBase    @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  chunks        KnowledgeChunk[]
+
+  @@index([knowledgeBaseId])
+  @@map("knowledge_sources")
+}
+
+/// RAG chunk with pgvector embedding. Similarity search runs via raw SQL:
+///   ORDER BY embedding <=> $query LIMIT k
+model KnowledgeChunk {
+  id              String  @id @default(cuid())
+  knowledgeBaseId String
+  sourceId        String
+  content         String
+  /// Position within the source document
+  chunkIndex      Int
+  metadata        Json    @default("{}")
+  embedding       Unsupported("vector(1536)")?
+  createdAt       DateTime @default(now())
+
+  knowledgeBase KnowledgeBase   @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  source        KnowledgeSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@index([knowledgeBaseId])
+  @@index([sourceId])
+  @@map("knowledge_chunks")
+}
+
+// ==============================================================================
+// 8. INTEGRATIONS — OUTGOING WEBHOOKS
+// ==============================================================================
+
+model Webhook {
+  id          String   @id @default(cuid())
+  workspaceId String
+  url         String
+  /// Subscribed events, e.g. ["contact.created", "message.received", "flow.completed"]
+  events      String[]
+  /// HMAC-SHA256 signing secret (sent as X-FlowFable-Signature)
+  secret      String
+  isEnabled   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace  Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([workspaceId])
+  @@map("webhooks")
+}
+
+enum DeliveryStatus {
+  PENDING
+  SUCCESS
+  FAILED // exhausted retries
+}
+
+model WebhookDelivery {
+  id             String         @id @default(cuid())
+  webhookId      String
+  event          String
+  payload        Json
+  status         DeliveryStatus @default(PENDING)
+  attempts       Int            @default(0)
+  responseStatus Int?
+  responseBody   String?
+  nextRetryAt    DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId, createdAt])
+  @@index([status, nextRetryAt])
+  @@map("webhook_deliveries")
+}
+
+// ==============================================================================
+// 9. OBSERVABILITY — ANALYTICS & AUDIT
+// ==============================================================================
+
+/// Pre-aggregated daily metrics per workspace (and optionally per channel),
+/// written by a nightly rollup job + incremented in real time by workers.
+/// Raw truth stays in messages/conversations/flow_sessions.
+model DailyStat {
+  id          String   @id @default(cuid())
+  workspaceId String
+  channelId   String? // null = workspace-wide rollup
+  date        DateTime @db.Date
+  metrics     Json     @default("{}")
+  // metrics shape (documented, kept flexible on purpose):
+  // { newContacts, messagesIn, messagesOut, conversationsOpened,
+  //   conversationsResolved, flowRuns, flowCompletions, aiReplies,
+  //   handovers, broadcastsSent }
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, channelId, date])
+  @@index([workspaceId, date])
+  @@map("daily_stats")
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  workspaceId String
+  actorId     String? // null for system actions
+  /// "flow.published", "channel.connected", "member.removed", …
+  action      String
+  /// Affected entity: { type: "flow", id: "..." }
+  target      Json?
+  metadata    Json     @default("{}")
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actor     User?     @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@map("audit_logs")
+}
