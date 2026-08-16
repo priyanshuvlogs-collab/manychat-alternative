@@ -1,0 +1,17 @@
+{
+  "name": "@flowfable/api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FlowFable API — NestJS backend: REST API, webhook ingestion, flow engine, workers",
+  "scripts": {
+    "lint": "echo 'api: scaffolded in Phase 2'",
+    "typecheck": "echo 'api: scaffolded in Phase 2'"
+  },
+  "dependencies": {
+    "@flowfable/database": "workspace:*",
+    "@flowfable/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@flowfable/tsconfig": "workspace:*"
+  }
+}

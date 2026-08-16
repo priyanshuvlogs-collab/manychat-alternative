@@ -1,0 +1,16 @@
+{
+  "name": "@flowfable/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FlowFable Web — Next.js 15 dashboard: inbox, flow builder, CRM, analytics",
+  "scripts": {
+    "lint": "echo 'web: scaffolded in Phase 2'",
+    "typecheck": "echo 'web: scaffolded in Phase 2'"
+  },
+  "dependencies": {
+    "@flowfable/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@flowfable/tsconfig": "workspace:*"
+  }
+}
