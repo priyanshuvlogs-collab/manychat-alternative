@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Builds
+dist/
+build/
+.next/
+out/
+.turbo/
+
+# Environment — never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Prisma
+packages/database/src/generated/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Testing
+coverage/
+.nyc_output/
+
+# Editors & OS
+.DS_Store
+.idea/
+*.swp
+*.swo
+
+# Docker volumes (local bind mounts)
+.docker-data/

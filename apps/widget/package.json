@@ -1,0 +1,13 @@
+{
+  "name": "@flowfable/widget",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FlowFable embeddable live-chat widget (vanilla TS, single script tag)",
+  "scripts": {
+    "lint": "echo 'widget: scaffolded in Phase 3'",
+    "typecheck": "echo 'widget: scaffolded in Phase 3'"
+  },
+  "devDependencies": {
+    "@flowfable/tsconfig": "workspace:*"
+  }
+}

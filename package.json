@@ -1,0 +1,39 @@
+{
+  "name": "flowfable",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FlowFable — the open-source omnichannel chat automation platform. A self-hostable alternative to ManyChat.",
+  "license": "MIT",
+  "author": "FlowFable Contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/priyanshuvlogs-collab/manychat-alternative"
+  },
+  "packageManager": "pnpm@10.33.3",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\"",
+    "db:generate": "pnpm --filter @flowfable/database db:generate",
+    "db:migrate": "pnpm --filter @flowfable/database db:migrate",
+    "db:push": "pnpm --filter @flowfable/database db:push",
+    "db:seed": "pnpm --filter @flowfable/database db:seed",
+    "db:studio": "pnpm --filter @flowfable/database db:studio",
+    "docker:infra": "docker compose up -d postgres redis mailpit",
+    "docker:up": "docker compose --profile app up -d --build",
+    "docker:down": "docker compose --profile app down"
+  },
+  "devDependencies": {
+    "prettier": "^3.4.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2"
+  }
+}
